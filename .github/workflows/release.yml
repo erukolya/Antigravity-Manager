@@ -1,4 +1,5 @@
 name: Release
+
 on:
   push:
     tags:
@@ -9,9 +10,88 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build-tauri:
+  validate-release:
+    runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate release version
+        id: meta
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+
+          with open("src-tauri/tauri.conf.json", "r", encoding="utf-8") as f:
+              tauri_version = json.load(f)["version"]
+
+          with open("package.json", "r", encoding="utf-8") as f:
+              package_version = json.load(f)["version"]
+
+          with open("src-tauri/Cargo.toml", "rb") as f:
+              cargo_version = tomllib.load(f)["package"]["version"]
+
+          versions = {
+              "src-tauri/tauri.conf.json": tauri_version,
+              "package.json": package_version,
+              "src-tauri/Cargo.toml": cargo_version,
+          }
+
+          if len(set(versions.values())) != 1:
+              details = ", ".join(f"{path}={version}" for path, version in versions.items())
+              raise SystemExit(f"Release versions do not match: {details}")
+
+          version = tauri_version
+
+          # WiX/MSI rejects textual prerelease identifiers such as
+          # 4.5.7-erukolya.1. For MSI builds, the optional prerelease part
+          # must be a single numeric identifier <= 65535.
+          match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-(\d+))?", version)
+          if not match:
+              raise SystemExit(
+                  "Windows MSI-incompatible version "
+                  f"{version!r}. Use X.Y.Z or X.Y.Z-N where N is numeric."
+              )
+
+          prerelease = match.group(4)
+          if prerelease is not None and int(prerelease) > 65535:
+              raise SystemExit(
+                  f"Windows MSI prerelease identifier {prerelease} exceeds 65535."
+              )
+
+          tag = f"v{version}"
+          if os.environ.get("REF_TYPE") == "tag" and os.environ.get("REF_NAME") != tag:
+              raise SystemExit(
+                  f"Tag/version mismatch: pushed tag {os.environ.get('REF_NAME')!r}, "
+                  f"but app version requires {tag!r}."
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"tag={tag}\n")
+
+          print(f"Release version: {version}")
+          print(f"Release tag: {tag}")
+          print("Windows MSI version validation: OK")
+          PY
+
+  build-tauri:
+    needs: validate-release
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +110,7 @@ jobs:
             args: ""
 
     runs-on: ${{ matrix.platform }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,11 +158,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- ${{ matrix.args }}
 
-      # 3. 处理 macOS 架构重命名冲突 (解决 422 Already Exists)
       - name: Rename macOS assets for architecture
         if: matrix.platform == 'macos-latest'
         run: |
-          # 识别架构
           if [[ "${{ matrix.args }}" == *"--target aarch64-apple-darwin"* ]]; then
             ARCH="aarch64"
           elif [[ "${{ matrix.args }}" == *"--target x86_64-apple-darwin"* ]]; then
@@ -91,31 +170,29 @@ jobs:
           else
             ARCH="unknown"
           fi
-          
+
           echo "Detected architecture: $ARCH"
-          
-          # 进入产物目录
+
           cd src-tauri/target/*/release/bundle/macos/
-          
-          # 重命名 .app.tar.gz 和 .sig
+
           if [ -f "Antigravity Tools.app.tar.gz" ]; then
             mv "Antigravity Tools.app.tar.gz" "Antigravity Tools_${ARCH}.app.tar.gz"
-            mv "Antigravity Tools.app.tar.gz.sig" "Antigravity Tools_${ARCH}.app.tar.gz.sig"
+            if [ -f "Antigravity Tools.app.tar.gz.sig" ]; then
+              mv "Antigravity Tools.app.tar.gz.sig" "Antigravity Tools_${ARCH}.app.tar.gz.sig"
+            fi
             echo "Renamed assets to append Arch: $ARCH"
           fi
-          
-          # 更新对应的 updater.json (指向重命名后的文件)
+
           UPDATER_JSON="../../../updater/install.json"
           if [ ! -f "$UPDATER_JSON" ]; then
-             UPDATER_JSON=$(find ../../../updater -name "*.json" | head -n 1)
+            UPDATER_JSON=$(find ../../../updater -name "*.json" | head -n 1)
           fi
-          
-          if [ -f "$UPDATER_JSON" ]; then
+
+          if [ -n "$UPDATER_JSON" ] && [ -f "$UPDATER_JSON" ]; then
             echo "Updating $UPDATER_JSON to use renamed assets..."
             sed -i '' "s/Antigravity%20Tools.app.tar.gz/Antigravity%20Tools_${ARCH}.app.tar.gz/g" "$UPDATER_JSON"
           fi
 
-      # 1. 上传 updater.json 到 Artifacts (供后续合并使用)
       - name: Upload updater json
         uses: actions/upload-artifact@v4
         with:
@@ -123,7 +200,6 @@ jobs:
           path: src-tauri/target/**/release/bundle/updater/*.json
           if-no-files-found: ignore
 
-      # 2. 上传安装包到 Artifacts (供后续统一发布任务下载)
       - name: Upload Release Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -146,15 +222,15 @@ jobs:
           if-no-files-found: warn
 
   publish-release:
-    needs: build-tauri
+    needs: [validate-release, build-tauri]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 下载所有构建产物 (仅限 release 相关的 assets 和 updater)
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -163,10 +239,11 @@ jobs:
           merge-multiple: true
 
       - name: Extract Release Notes
+        env:
+          RELEASE_TAG: ${{ needs.validate-release.outputs.tag }}
         run: |
-          VERSION="${{ github.ref_name }}"
-          echo "Extracting release notes for version $VERSION"
-          awk -v ver="$VERSION" '
+          echo "Extracting release notes for version $RELEASE_TAG"
+          awk -v ver="$RELEASE_TAG" '
             BEGIN { capture=0 }
             $0 ~ "^[[:space:]]*[*+-][[:space:]]+\\*\\*" ver { capture=1; next }
             capture && $0 ~ "^[[:space:]]*[*+-][[:space:]]+\\*\\*v" { capture=0; exit }
@@ -178,13 +255,12 @@ jobs:
 
       - name: Build updater.json from signatures
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate-release.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
           DOWNLOAD_BASE="https://github.com/${REPO}/releases/download/${VERSION}"
           VER="${VERSION#v}"
 
-          # Helper: read signature content from .sig file in artifacts
           read_sig() {
             local pattern="$1"
             local sig_file
@@ -196,7 +272,6 @@ jobs:
             fi
           }
 
-          # Read signatures for each platform
           MACOS_AARCH64_SIG=$(read_sig "*_aarch64.app.tar.gz.sig")
           MACOS_X64_SIG=$(read_sig "*_x64.app.tar.gz.sig")
           WINDOWS_NSIS_SIG=$(read_sig "*_x64-setup.exe.sig")
@@ -210,9 +285,6 @@ jobs:
           [ -n "$LINUX_AMD64_SIG" ] && echo "  Linux amd64: YES" || echo "  Linux amd64: NO"
           [ -n "$LINUX_AARCH64_SIG" ] && echo "  Linux aarch64: YES" || echo "  Linux aarch64: NO"
 
-          # Build updater.json with platform-specific download URLs and signatures
-          # macOS: arch-suffixed filenames (no version in name)
-          # Windows/Linux: version included in filename
           jq -n \
             --arg version "$VER" \
             --arg notes "See release page for details" \
@@ -272,13 +344,13 @@ jobs:
           done
           find release-files -maxdepth 1 -type f -print
 
-      # 使用 ncipollo/release-action 进行统一发布，支持稳健覆盖
       - name: Create or Update GitHub Release
         uses: ncipollo/release-action@v1
-        if: startsWith(github.ref, 'refs/tags/')
         with:
+          tag: ${{ needs.validate-release.outputs.tag }}
+          commit: ${{ github.sha }}
           allowUpdates: true
-          name: "Antigravity Tools ${{ github.ref_name }}"
+          name: "Antigravity Tools ${{ needs.validate-release.outputs.tag }}"
           bodyFile: "release_notes.md"
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: "release-files/*,updater.json"
@@ -287,6 +359,7 @@ jobs:
           makeLatest: legacy
 
   docker-build-amd64:
+    needs: validate-release
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' && (github.repository == 'lbjlaq/Antigravity-Manager' || vars.ENABLE_DOCKER_PUSH == 'true')
     steps:
@@ -311,11 +384,12 @@ jobs:
           push: true
           tags: |
             ${{ github.repository_owner }}/antigravity-manager:latest-amd64
-            ${{ github.repository_owner }}/antigravity-manager:${{ github.ref_name }}-amd64
+            ${{ github.repository_owner }}/antigravity-manager:${{ needs.validate-release.outputs.tag }}-amd64
           build-args: |
             USE_MIRROR=false
 
   docker-build-arm64:
+    needs: validate-release
     runs-on: ubuntu-24.04-arm
     if: github.event_name != 'pull_request' && (github.repository == 'lbjlaq/Antigravity-Manager' || vars.ENABLE_DOCKER_PUSH == 'true')
     steps:
@@ -340,12 +414,12 @@ jobs:
           push: true
           tags: |
             ${{ github.repository_owner }}/antigravity-manager:latest-arm64
-            ${{ github.repository_owner }}/antigravity-manager:${{ github.ref_name }}-arm64
+            ${{ github.repository_owner }}/antigravity-manager:${{ needs.validate-release.outputs.tag }}-arm64
           build-args: |
             USE_MIRROR=false
 
   docker-manifest:
-    needs: [docker-build-amd64, docker-build-arm64]
+    needs: [validate-release, docker-build-amd64, docker-build-arm64]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' && (github.repository == 'lbjlaq/Antigravity-Manager' || vars.ENABLE_DOCKER_PUSH == 'true')
     steps:
@@ -361,6 +435,6 @@ jobs:
             ${{ github.repository_owner }}/antigravity-manager:latest-amd64 \
             ${{ github.repository_owner }}/antigravity-manager:latest-arm64
 
-          docker buildx imagetools create -t ${{ github.repository_owner }}/antigravity-manager:${{ github.ref_name }} \
-            ${{ github.repository_owner }}/antigravity-manager:${{ github.ref_name }}-amd64 \
-            ${{ github.repository_owner }}/antigravity-manager:${{ github.ref_name }}-arm64
+          docker buildx imagetools create -t ${{ github.repository_owner }}/antigravity-manager:${{ needs.validate-release.outputs.tag }} \
+            ${{ github.repository_owner }}/antigravity-manager:${{ needs.validate-release.outputs.tag }}-amd64 \
+            ${{ github.repository_owner }}/antigravity-manager:${{ needs.validate-release.outputs.tag }}-arm64
