@@ -1,0 +1,108 @@
+name: Release-Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "src-tauri/tauri.conf.json"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-windows:
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $config = Get-Content -Raw "src-tauri/tauri.conf.json" | ConvertFrom-Json
+          $version = $config.version
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Version is empty in src-tauri/tauri.conf.json"
+          }
+          Write-Host "Building Windows release version $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Rust setup
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Node.js setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install frontend dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Disable updater artifacts without signing key
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Host "Updater signing key is configured; keeping updater artifacts enabled."
+            exit 0
+          }
+
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content -Raw $configPath | ConvertFrom-Json
+          $config.bundle.createUpdaterArtifacts = $false
+          $config | ConvertTo-Json -Depth 32 | Set-Content -Path $configPath -Encoding UTF8
+          Write-Host "No updater signing key configured; disabled updater artifacts for this build."
+
+      - name: Build Windows app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-${{ steps.version.outputs.version }}
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.sig
+            src-tauri/target/release/bundle/nsis/*.sig
+          if-no-files-found: error
+
+  publish-windows:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release-${{ needs.build-windows.outputs.version }}
+          path: windows-release
+
+      - name: Create or update Windows GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.build-windows.outputs.version }}
+          commit: ${{ github.sha }}
+          allowUpdates: true
+          name: "Antigravity Tools v${{ needs.build-windows.outputs.version }} (Windows)"
+          body: "Windows-only release for Antigravity Tools v${{ needs.build-windows.outputs.version }}."
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: "windows-release/*"
+          artifactErrorsFailBuild: true
+          replacesArtifacts: true
+          makeLatest: true
