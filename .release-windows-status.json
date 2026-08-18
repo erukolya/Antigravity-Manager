@@ -1,0 +1,16 @@
+{
+  "runs": [
+    {
+      "id": 32108654813,
+      "name": "Release-Windows",
+      "event": "push",
+      "status": "in_progress",
+      "conclusion": null,
+      "head_branch": "main",
+      "head_sha": "0ab567f1a84803a0cd75ac2da4f5d5882bd56913",
+      "html_url": "https://github.com/erukolya/Antigravity-Manager/actions/runs/32108654813",
+      "created_at": "2026-08-18T06:50:23Z",
+      "updated_at": "2026-08-18T06:50:25Z"
+    }
+  ]
+}
