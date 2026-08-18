@@ -23,16 +23,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Read version
+      - name: Validate Windows release version
         id: version
         shell: pwsh
         run: |
           $config = Get-Content -Raw "src-tauri/tauri.conf.json" | ConvertFrom-Json
-          $version = $config.version
+          $version = [string]$config.version
           if ([string]::IsNullOrWhiteSpace($version)) {
             throw "Version is empty in src-tauri/tauri.conf.json"
           }
+
+          if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)(?:-(\d+))?$') {
+            throw "Windows MSI-incompatible version '$version'. Use X.Y.Z or X.Y.Z-N where N is numeric."
+          }
+
+          if ($Matches[4] -and [int]$Matches[4] -gt 65535) {
+            throw "Windows MSI prerelease identifier '$($Matches[4])' exceeds 65535."
+          }
+
           Write-Host "Building Windows release version $version"
+          Write-Host "Windows MSI version validation: OK"
           "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Rust setup
@@ -93,6 +103,26 @@ jobs:
           name: windows-release-${{ needs.build-windows.outputs.version }}
           path: windows-release
 
+      - name: Collect Windows release files
+        shell: bash
+        run: |
+          mkdir -p windows-release-files
+          find windows-release -type f \( \
+            -name "*.msi" -o \
+            -name "*.exe" -o \
+            -name "*.sig" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp "$file" windows-release-files/
+          done
+
+          echo "Windows release files:"
+          find windows-release-files -maxdepth 1 -type f -print
+
+          if [ -z "$(find windows-release-files -maxdepth 1 -type f -print -quit)" ]; then
+            echo "No Windows release files found"
+            exit 1
+          fi
+
       - name: Create or update Windows GitHub Release
         uses: ncipollo/release-action@v1
         with:
@@ -102,7 +132,7 @@ jobs:
           name: "Antigravity Tools v${{ needs.build-windows.outputs.version }} (Windows)"
           body: "Windows-only release for Antigravity Tools v${{ needs.build-windows.outputs.version }}."
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: "windows-release/*"
+          artifacts: "windows-release-files/*"
           artifactErrorsFailBuild: true
           replacesArtifacts: true
           makeLatest: true
