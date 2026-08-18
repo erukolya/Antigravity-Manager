@@ -1128,7 +1128,7 @@ async fn try_compress_gemini_with_summary(
     );
 
     let upstream_url = format!(
-        "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal/projects/{}/locations/global/models/{}:generateContent",
+        "https://daily-cloudcode-pa.googleapis.com/v1internal/projects/{}/locations/global/models/{}:generateContent",
         project_id, INTERNAL_BACKGROUND_TASK
     );
 
