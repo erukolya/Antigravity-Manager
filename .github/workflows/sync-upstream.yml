@@ -1,0 +1,39 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_revision:
+        description: Increment fork revision for another fork-only patch on the same upstream version
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync latest lbjlaq upstream with deterministic fork overlay
+        shell: bash
+        env:
+          BUMP_REVISION: ${{ inputs.bump_revision || false }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$BUMP_REVISION" == "true" ]]; then
+            args+=(--bump-revision)
+          fi
+          python3 .github/scripts/sync-upstream.py "${args[@]}"

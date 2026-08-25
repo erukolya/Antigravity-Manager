@@ -1,0 +1,6 @@
+{
+  "client_endpoints_sha256": "7cd35d24dffc2a4c7f6d921e339d3e3f4a0b8b26d329865396b35b4cc21fae07",
+  "client_fallback_sha256": "2aa6b6f4e0be840eb0a760ceefc04c8bb3bd2ad3a02068357f34c9f547949537",
+  "client_retry_sha256": "379e4e1cd4f9ea42baf5f45b11bb36ac88490c2bc60c58e1e944e7ccd743dec1",
+  "quota_endpoints_sha256": "d023c5a0022d09f0e1f6364ed5beae4f6a1ca9eae07040413838f75f23e6aff8"
+}

@@ -61,18 +61,17 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
     }
 }
 
-// Cloud Code v1internal endpoints (fallback order: Sandbox → Daily → Prod)
-// 优先使用 Sandbox/Daily 环境以避免 Prod环境的 429 错误 (Ref: Issue #1176)
+// Cloud Code v1internal endpoints (fallback order: Daily → Prod)
 const V1_INTERNAL_BASE_URL_PROD: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 const V1_INTERNAL_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
-const V1_INTERNAL_BASE_URL_SANDBOX: &str =
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
 
-const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
-    V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 1: Sandbox (已知有效且稳定)
-    V1_INTERNAL_BASE_URL_DAILY,   // 优先级 2: Daily (备用)
-    V1_INTERNAL_BASE_URL_PROD,    // 优先级 3: Prod (仅作为兜底)
+const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 2] = [
+    V1_INTERNAL_BASE_URL_DAILY,
+    V1_INTERNAL_BASE_URL_PROD,
 ];
+
+const V1_INTERNAL_RETRY_ROUND_DELAYS_SECS: [u64; 2] = [5, 30];
+const V1_INTERNAL_RETRY_ROUNDS: usize = V1_INTERNAL_RETRY_ROUND_DELAYS_SECS.len() + 1;
 
 pub struct UpstreamClient {
     default_client: RwLock<Client>,
@@ -286,11 +285,44 @@ impl UpstreamClient {
         }
     }
 
-    /// Determine if we should try next endpoint (fallback logic)
+    /// Determine if we should try the next endpoint / retry round.
     fn should_try_next_endpoint(status: StatusCode) -> bool {
         status == StatusCode::REQUEST_TIMEOUT
             || status == StatusCode::NOT_FOUND
+            || status == StatusCode::TOO_MANY_REQUESTS
             || status.is_server_error()
+    }
+
+    fn is_geo_location_error_body(body: &[u8]) -> bool {
+        String::from_utf8_lossy(body).contains("User location is not supported")
+    }
+
+    /// Inspect a 400 response without losing its body for downstream error handling.
+    async fn inspect_bad_request(resp: Response) -> Result<(Response, bool), String> {
+        if resp.status() != StatusCode::BAD_REQUEST {
+            return Ok((resp, false));
+        }
+
+        let status = resp.status();
+        let version = resp.version();
+        let headers = resp.headers().clone();
+        let url = resp.url().clone();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to buffer 400 response body: {}", e))?;
+        let is_geo_error = Self::is_geo_location_error_body(&body);
+
+        use rquest::ResponseBuilderExt;
+        let mut builder = hyper::Response::builder().status(status).version(version).url(url);
+        *builder
+            .headers_mut()
+            .ok_or_else(|| "Failed to rebuild 400 response headers".to_string())? = headers;
+        let rebuilt = builder
+            .body(body)
+            .map_err(|e| format!("Failed to rebuild 400 response: {}", e))?;
+
+        Ok((Response::from(rebuilt), is_geo_error))
     }
 
     /// Call v1internal API (Basic Method)
@@ -399,129 +431,209 @@ impl UpstreamClient {
         tracing::debug!(?headers, "Final Upstream Request Headers");
 
         let mut has_triggered_downgrade = false;
+        let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
 
-        // [TEMPORARY FIX #3074] 针对 403 SERVICE_DISABLED 的自动降级重试逻辑
-        // 我们包装一层循环，以便在检测到特定错误时移除 Header 并重试
-        loop {
+        // Preserve the existing one-shot 403 project-header downgrade, but each mode gets
+        // a fresh set of three complete Daily → Prod rounds.
+        'request_mode: loop {
             let mut last_err: Option<String> = None;
-            let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
             let mut should_retry_without_header = false;
 
-            // 遍历所有端点，失败时自动切换
-            for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
-                let url = Self::build_url(base_url, method, query_string);
-                let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
+            'rounds: for round_idx in 0..V1_INTERNAL_RETRY_ROUNDS {
+                for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
+                    let url = Self::build_url(base_url, method, query_string);
+                    let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
 
-                let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+                    let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
-                let mut req_builder = client.post(&url).headers(headers.clone());
+                    let mut req_builder = client.post(&url).headers(headers.clone());
 
-                // [FIX] 仅对流式接口 (streamGenerateContent) 使用分块传输仿真
-                // 对其他接口 (如 generateContent, loadCodeAssist) 发送正常的固定长度 Body
-                // 否则图像生成会因为缺少 Content-Length 而被 Google 服务端拒绝或限流 (429)
-                if method == "streamGenerateContent" {
-                    let stream_bytes = body_bytes.clone();
-                    req_builder = req_builder.body(rquest::Body::wrap_stream(
-                        futures::stream::once(async move { Ok::<_, std::io::Error>(stream_bytes) }),
-                    ));
-                } else {
-                    req_builder = req_builder.body(body_bytes.clone());
-                }
+                    // [FIX] 仅对流式接口 (streamGenerateContent) 使用分块传输仿真
+                    // 对其他接口 (如 generateContent, loadCodeAssist) 发送正常的固定长度 Body
+                    // 否则图像生成会因为缺少 Content-Length 而被 Google 服务端拒绝或限流 (429)
+                    if method == "streamGenerateContent" {
+                        let stream_bytes = body_bytes.clone();
+                        req_builder = req_builder.body(rquest::Body::wrap_stream(
+                            futures::stream::once(async move { Ok::<_, std::io::Error>(stream_bytes) }),
+                        ));
+                    } else {
+                        req_builder = req_builder.body(body_bytes.clone());
+                    }
 
-                let response = req_builder.send().await;
-
-                match response {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            if idx > 0 {
-                                tracing::info!(
-                                    "✓ Upstream fallback succeeded | Endpoint: {} | Status: {} | Next endpoints available: {}",
-                                    base_url,
-                                    status,
-                                    V1_INTERNAL_BASE_URL_FALLBACKS.len() - idx - 1
-                                );
-                            } else {
-                                tracing::debug!(
-                                    "✓ Upstream request succeeded | Endpoint: {} | Status: {}",
-                                    base_url,
-                                    status
-                                );
+                    match req_builder.send().await {
+                        Ok(mut resp) => {
+                            let status = resp.status();
+                            if status.is_success() {
+                                if idx > 0 || round_idx > 0 {
+                                    tracing::info!(
+                                        "✓ Upstream fallback succeeded | Endpoint: {} | Round: {}/{} | Status: {}",
+                                        base_url,
+                                        round_idx + 1,
+                                        V1_INTERNAL_RETRY_ROUNDS,
+                                        status
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "✓ Upstream request succeeded | Endpoint: {} | Status: {}",
+                                        base_url,
+                                        status
+                                    );
+                                }
+                                return Ok(UpstreamCallResult {
+                                    response: resp,
+                                    fallback_attempts,
+                                });
                             }
+
+                            // Existing one-shot downgrade: any 403 with x-goog-user-project
+                            // removes the header and restarts all retry rounds exactly once.
+                            if status == StatusCode::FORBIDDEN
+                                && !has_triggered_downgrade
+                                && headers.contains_key("x-goog-user-project")
+                            {
+                                tracing::warn!(
+                                    "Detected 403 Forbidden with project header, retrying WITHOUT x-goog-user-project header (Account: {:?})",
+                                    account_id
+                                );
+                                should_retry_without_header = true;
+                                break 'rounds;
+                            }
+
+                            let mut is_geo_location_error = false;
+                            if status == StatusCode::BAD_REQUEST {
+                                match Self::inspect_bad_request(resp).await {
+                                    Ok((rebuilt, is_geo)) => {
+                                        resp = rebuilt;
+                                        is_geo_location_error = is_geo;
+                                    }
+                                    Err(e) => {
+                                        let msg = format!(
+                                            "HTTP response read failed at {}: {}",
+                                            base_url, e
+                                        );
+                                        tracing::warn!("{}", msg);
+                                        fallback_attempts.push(FallbackAttemptLog {
+                                            endpoint_url: url.clone(),
+                                            status: Some(status.as_u16()),
+                                            error: msg.clone(),
+                                        });
+                                        last_err = Some(msg);
+
+                                        if has_next {
+                                            continue;
+                                        }
+                                        if round_idx + 1 < V1_INTERNAL_RETRY_ROUNDS {
+                                            let delay = V1_INTERNAL_RETRY_ROUND_DELAYS_SECS[round_idx];
+                                            tracing::warn!(
+                                                "Upstream round {}/{} exhausted after response-read failure; retrying Daily → Prod in {}s",
+                                                round_idx + 1,
+                                                V1_INTERNAL_RETRY_ROUNDS,
+                                                delay
+                                            );
+                                            tokio::time::sleep(Duration::from_secs(delay)).await;
+                                            continue 'rounds;
+                                        }
+                                        break 'rounds;
+                                    }
+                                }
+                            }
+
+                            let retryable =
+                                Self::should_try_next_endpoint(status) || is_geo_location_error;
+
+                            if retryable {
+                                let err_msg = if is_geo_location_error {
+                                    format!(
+                                        "Upstream {} returned 400 User location is not supported",
+                                        base_url
+                                    )
+                                } else {
+                                    format!("Upstream {} returned {}", base_url, status)
+                                };
+
+                                tracing::warn!(
+                                    "Upstream endpoint retryable failure at {} (method={}, round={}/{}): {}",
+                                    base_url,
+                                    method,
+                                    round_idx + 1,
+                                    V1_INTERNAL_RETRY_ROUNDS,
+                                    err_msg
+                                );
+                                fallback_attempts.push(FallbackAttemptLog {
+                                    endpoint_url: url.clone(),
+                                    status: Some(status.as_u16()),
+                                    error: err_msg.clone(),
+                                });
+                                last_err = Some(err_msg);
+
+                                if has_next {
+                                    continue;
+                                }
+
+                                if round_idx + 1 < V1_INTERNAL_RETRY_ROUNDS {
+                                    let delay = V1_INTERNAL_RETRY_ROUND_DELAYS_SECS[round_idx];
+                                    tracing::warn!(
+                                        "Upstream round {}/{} exhausted; retrying Daily → Prod in {}s",
+                                        round_idx + 1,
+                                        V1_INTERNAL_RETRY_ROUNDS,
+                                        delay
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                                    continue 'rounds;
+                                }
+
+                                // All three rounds are exhausted. Preserve the final HTTP response
+                                // so the agent receives the real terminal Google error body/status.
+                                return Ok(UpstreamCallResult {
+                                    response: resp,
+                                    fallback_attempts,
+                                });
+                            }
+
+                            // All other statuses, including non-geo HTTP 400, are terminal.
                             return Ok(UpstreamCallResult {
                                 response: resp,
                                 fallback_attempts,
                             });
                         }
-
-                        // [NEW] 检测 403 错误 (Issue #3074)
-                        // 只要带有项目 Header 且返回 403，我们就尝试降级重试一次
-                        if status == StatusCode::FORBIDDEN
-                            && !has_triggered_downgrade
-                            && headers.contains_key("x-goog-user-project")
-                        {
-                            tracing::warn!(
-                                "Detected 403 Forbidden with project header, retrying WITHOUT x-goog-user-project header (Account: {:?})",
-                                account_id
-                            );
-                            should_retry_without_header = true;
-                            break;
-                        }
-
-                        // 如果有下一个端点且当前错误可重试，则切换
-                        if has_next && Self::should_try_next_endpoint(status) {
-                            let err_msg = format!("Upstream {} returned {}", base_url, status);
-                            tracing::warn!(
-                                "Upstream endpoint returned {} at {} (method={}), trying next endpoint",
-                                status,
-                                base_url,
-                                method
-                            );
-                            // [NEW] 记录降级尝试
+                        Err(e) => {
+                            let msg = format!("HTTP request failed at {}: {}", base_url, e);
+                            tracing::debug!("{}", msg);
                             fallback_attempts.push(FallbackAttemptLog {
                                 endpoint_url: url.clone(),
-                                status: Some(status.as_u16()),
-                                error: err_msg.clone(),
+                                status: None,
+                                error: msg.clone(),
                             });
-                            last_err = Some(err_msg);
-                            continue;
-                        }
+                            last_err = Some(msg);
 
-                        // 不可重试的错误或已是最后一个端点，直接返回
-                        return Ok(UpstreamCallResult {
-                            response: resp,
-                            fallback_attempts,
-                        });
-                    }
-                    Err(e) => {
-                        let msg = format!("HTTP request failed at {}: {}", base_url, e);
-                        tracing::debug!("{}", msg);
-                        // [NEW] 记录网络错误的降级尝试
-                        fallback_attempts.push(FallbackAttemptLog {
-                            endpoint_url: url.clone(),
-                            status: None,
-                            error: msg.clone(),
-                        });
-                        last_err = Some(msg);
+                            if has_next {
+                                continue;
+                            }
 
-                        // 如果是最后一个端点，退出循环
-                        if !has_next {
-                            break;
+                            if round_idx + 1 < V1_INTERNAL_RETRY_ROUNDS {
+                                let delay = V1_INTERNAL_RETRY_ROUND_DELAYS_SECS[round_idx];
+                                tracing::warn!(
+                                    "Upstream round {}/{} exhausted by network errors; retrying Daily → Prod in {}s",
+                                    round_idx + 1,
+                                    V1_INTERNAL_RETRY_ROUNDS,
+                                    delay
+                                );
+                                tokio::time::sleep(Duration::from_secs(delay)).await;
+                                continue 'rounds;
+                            }
+
+                            break 'rounds;
                         }
-                        continue;
                     }
                 }
             }
 
-            // 处理降级逻辑
             if should_retry_without_header {
                 headers.remove("x-goog-user-project");
                 has_triggered_downgrade = true;
-                // 重启外层 loop，从第一个端点再次尝试
-                continue;
+                continue 'request_mode;
             }
 
-            // 如果没有触发降级且所有端点都尝试过，返回最后的错误
             return Err(last_err.unwrap_or_else(|| "All endpoints failed".to_string()));
         }
     }
@@ -576,6 +688,20 @@ impl UpstreamClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_geo_location_error_is_selective() {
+        assert!(UpstreamClient::is_geo_location_error_body(
+            br#"{"error":{"message":"User location is not supported"}}"#
+        ));
+        assert!(!UpstreamClient::is_geo_location_error_body(
+            br#"{"error":{"message":"Malformed request"}}"#
+        ));
+        assert!(!UpstreamClient::should_try_next_endpoint(StatusCode::BAD_REQUEST));
+        assert!(UpstreamClient::should_try_next_endpoint(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+    }
 
     #[test]
     fn test_build_url() {
